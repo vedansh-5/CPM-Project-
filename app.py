@@ -5,6 +5,7 @@ Main entry point: streamlit run app.py
 
 import streamlit as st
 import pandas as pd
+import io
 
 from config import RESOURCE_POOLS, OBJECTIVE_WEIGHTS
 from data_generator import generate_project_tasks, tasks_to_dataframe
@@ -31,6 +32,9 @@ from ml_quality import (
     compute_shap_explanations, explain_single_prediction,
     detect_data_drift, simulate_drift_scenario,
 )
+from monte_carlo import run_monte_carlo
+from evm import compute_evm
+from crashing import compute_crash_tradeoff
 from visualizations import (
     create_gantt_chart_bar,
     create_resource_heatmap,
@@ -48,6 +52,12 @@ from visualizations import (
     create_shap_bar_chart,
     create_shap_waterfall,
     create_drift_chart,
+    create_monte_carlo_histogram,
+    create_criticality_chart,
+    create_evm_scurve,
+    create_crash_tradeoff_chart,
+    create_dag_chart,
+    create_map_view,
 )
 
 # ─── Page Config ─────────────────────────────────────────────────────
@@ -120,6 +130,15 @@ with st.sidebar:
         format_func=lambda k: SCENARIO_LIBRARY[k].name,
     )
 
+    st.subheader("📈 EVM Settings")
+    evm_progress = st.slider("Simulated Progress %", 10, 90, 50, 5)
+    evm_cost_var = st.slider("Cost Variance Factor", 0.90, 1.20, 1.05, 0.01)
+
+    st.subheader("📤 Data Import")
+    uploaded_file = st.file_uploader("Upload Task CSV", type=["csv"])
+    if uploaded_file:
+        st.success(f"Loaded: {uploaded_file.name}")
+
     run_btn = st.button("🚀 Run Optimization", type="primary", use_container_width=True)
 
 # ─── Main Logic ──────────────────────────────────────────────────────
@@ -167,9 +186,10 @@ if run_btn or "schedule" in st.session_state:
         )
 
     # ─── Dashboard Tabs ─────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab_ml, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab_ml, tab5, tab6, tab7, tab_mc, tab_evm, tab_crash, tab_map, tab8 = st.tabs([
         "📊 Schedule", "🔧 Resources", "💰 Cost", "🤖 AI Risk",
-        "🧪 ML Quality", "🌦️ Live Data", "📏 Constraints", "🔬 Simulator", "📋 Data",
+        "🧪 ML Quality", "🌦️ Live Data", "📏 Constraints", "🔬 Simulator",
+        "🎲 Monte Carlo", "📈 EVM", "⚡ Crashing", "🗺️ Map", "📋 Data",
     ])
 
     # ── Tab 1: Schedule ──────────────────────────────────────────────
@@ -192,6 +212,13 @@ if run_btn or "schedule" in st.session_state:
             pd.DataFrame(critical_tasks)[["task_name", "start_week", "end_week", "duration"]],
             use_container_width=True,
             hide_index=True,
+        )
+
+        # DAG Network Graph
+        st.subheader("🕸️ Task Dependency Network (DAG)")
+        st.plotly_chart(
+            create_dag_chart(tasks, result["schedule"]),
+            use_container_width=True,
         )
 
     # ── Tab 2: Resources ─────────────────────────────────────────────
@@ -538,7 +565,98 @@ if run_btn or "schedule" in st.session_state:
                 })
             st.dataframe(pd.DataFrame(lib_data), use_container_width=True, hide_index=True)
 
-    # ── Tab 8: Raw Data ──────────────────────────────────────────────
+    # ── Tab: Monte Carlo Simulation ────────────────────────────────────
+    with tab_mc:
+        st.subheader("🎲 Monte Carlo Probabilistic Scheduling")
+        st.markdown("PERT-distributed durations × 1,000 simulations → confidence intervals.")
+
+        mc_sims = st.select_slider("Simulations", [500, 1000, 2000, 5000], value=1000)
+        with st.spinner(f"Running {mc_sims} Monte Carlo simulations..."):
+            mc = run_monte_carlo(n_simulations=mc_sims)
+
+        p = mc["percentiles"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("P50 (Median)", f"{p['P50']} weeks")
+        c2.metric("P80", f"{p['P80']} weeks")
+        c3.metric("P90", f"{p['P90']} weeks")
+        c4.metric("Mean ± Std", f"{p['Mean']} ± {p['Std']}")
+
+        st.plotly_chart(create_monte_carlo_histogram(mc["makespans"], p), use_container_width=True)
+        st.plotly_chart(create_criticality_chart(mc["task_stats"]), use_container_width=True)
+
+        st.subheader("Per-Task PERT Statistics")
+        st.dataframe(mc["task_stats"], use_container_width=True, hide_index=True)
+
+    # ── Tab: Earned Value Management ──────────────────────────────────
+    with tab_evm:
+        st.subheader("📈 Earned Value Management (EVM)")
+        st.markdown("S-Curve analysis with CPI, SPI, EAC, ETC indicators.")
+
+        with st.spinner("Computing EVM metrics..."):
+            evm_data = compute_evm(
+                result["schedule"], result["makespan"],
+                progress_pct=evm_progress / 100, cost_variance_factor=evm_cost_var,
+            )
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("CPI", f"{evm_data['CPI']}", delta=evm_data["cost_status"])
+        c2.metric("SPI", f"{evm_data['SPI']}", delta=evm_data["schedule_status"])
+        c3.metric("EAC", f"₹{evm_data['EAC']:,.0f}")
+        c4.metric("BAC", f"₹{evm_data['BAC']:,.0f}")
+
+        st.plotly_chart(create_evm_scurve(evm_data), use_container_width=True)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Cost Variance (CV)", f"₹{evm_data['CV']:,.0f}")
+        c2.metric("Schedule Variance (SV)", f"₹{evm_data['SV']:,.0f}")
+        c3.metric("Estimate to Complete (ETC)", f"₹{evm_data['ETC']:,.0f}")
+        c4.metric("Variance at Completion (VAC)", f"₹{evm_data['VAC']:,.0f}")
+
+        st.subheader("📖 EVM Glossary")
+        st.markdown("""
+        | Metric | Formula | Meaning |
+        |---|---|---|
+        | **CPI** | EV / AC | Cost efficiency (>1 = under budget) |
+        | **SPI** | EV / PV | Schedule efficiency (>1 = ahead) |
+        | **EAC** | BAC / CPI | Estimated total cost at completion |
+        | **ETC** | EAC − AC | Remaining cost to finish |
+        | **VAC** | BAC − EAC | Expected budget surplus/deficit |
+        """)
+
+    # ── Tab: Schedule Crashing ────────────────────────────────────────
+    with tab_crash:
+        st.subheader("⚡ Schedule Crashing — Cost-Time Tradeoff")
+        st.markdown("Progressively crash critical tasks to reduce makespan at additional cost.")
+
+        with st.spinner("Computing crash tradeoff..."):
+            crash = compute_crash_tradeoff(max_steps=10)
+
+        if len(crash["tradeoff_curve"]) > 0:
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Baseline Makespan", f"{crash['base_makespan']} weeks")
+            c2.metric("Best Crashed Makespan", f"{crash['best_makespan']} weeks")
+            c3.metric("Total Crash Cost", f"₹{crash['total_crash_cost']:,.0f}")
+
+            st.plotly_chart(create_crash_tradeoff_chart(crash["tradeoff_curve"]), use_container_width=True)
+
+            st.subheader("Crash Steps")
+            st.dataframe(crash["tradeoff_curve"], use_container_width=True, hide_index=True)
+
+            st.subheader("Crash Plan — Available Tasks")
+            st.dataframe(crash["crash_plan"], use_container_width=True, hide_index=True)
+        else:
+            st.warning("Could not compute crash tradeoff.")
+
+    # ── Tab: Map View ────────────────────────────────────────────────
+    with tab_map:
+        st.subheader("🗺️ Geospatial View — NH-48 Route")
+        st.markdown("Tasks plotted along the highway alignment. Red = Critical Path.")
+        st.plotly_chart(
+            create_map_view(tasks, result["schedule"]),
+            use_container_width=True,
+        )
+
+    # ── Tab: Raw Data ────────────────────────────────────────────────
     with tab8:
         st.subheader("Task Details")
         st.dataframe(tasks_to_dataframe(tasks), use_container_width=True, hide_index=True)
@@ -548,6 +666,13 @@ if run_btn or "schedule" in st.session_state:
 
         st.subheader("Risk Predictions")
         st.dataframe(risk_df, use_container_width=True, hide_index=True)
+
+        # CSV Export
+        st.subheader("📥 Export Data")
+        csv_buf = io.StringIO()
+        pd.DataFrame(result["schedule"]).to_csv(csv_buf, index=False)
+        st.download_button("Download Schedule CSV", csv_buf.getvalue(),
+                           file_name="roadopt_schedule.csv", mime="text/csv")
 
 else:
     # Landing page
@@ -566,11 +691,11 @@ else:
 
     col4, col5, col6 = st.columns(3)
     with col4:
-        st.markdown("### 🌦️ Live Data Connectors")
-        st.markdown("Weather, traffic, holidays & strike data feed into project risk scoring")
+        st.markdown("### 🎲 Monte Carlo Simulation")
+        st.markdown("PERT distributions + 1000 simulations → P50/P80/P90 confidence intervals")
     with col5:
-        st.markdown("### 📏 Business Constraints")
-        st.markdown("Driver shift limits, fuel budgets, time windows & priority milestone tracking")
+        st.markdown("### 📈 Earned Value Management")
+        st.markdown("S-Curve, CPI, SPI, EAC — full EVM dashboard for project cost & schedule control")
     with col6:
-        st.markdown("### 🔬 Scenario Simulator")
-        st.markdown("Compare 7+ pre-built scenarios: monsoon, labor crisis, budget crunch, worst-case & more")
+        st.markdown("### ⚡ Schedule Crashing")
+        st.markdown("Cost-time tradeoff analysis to accelerate critical path tasks")
