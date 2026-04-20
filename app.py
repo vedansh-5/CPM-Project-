@@ -10,12 +10,44 @@ from config import RESOURCE_POOLS, OBJECTIVE_WEIGHTS
 from data_generator import generate_project_tasks, tasks_to_dataframe
 from optimizer import compute_critical_path, solve_rcpsp, estimate_cost
 from ai_predictor import train_delay_model, predict_task_delays
+from live_data import (
+    fetch_weather_forecast, weather_to_dataframe,
+    fetch_traffic_conditions, traffic_summary_dataframe,
+    fetch_calendar_events, events_to_dataframe,
+    compute_weekly_external_risk,
+)
+from constraints import (
+    run_all_constraint_checks, FuelBudget, ShiftPolicy,
+    validate_shift_constraints, validate_fuel_budget,
+    validate_time_windows, validate_priority_milestones,
+)
+from simulator import (
+    SCENARIO_LIBRARY, Scenario, build_custom_scenario,
+    run_scenario, run_comparison,
+)
+from ml_quality import (
+    benchmark_models, benchmark_to_dataframe,
+    train_quantile_models, predict_with_uncertainty,
+    compute_shap_explanations, explain_single_prediction,
+    detect_data_drift, simulate_drift_scenario,
+)
 from visualizations import (
     create_gantt_chart_bar,
     create_resource_heatmap,
     create_cost_breakdown,
     create_risk_chart,
     create_feature_importance_chart,
+    create_scenario_comparison_bar,
+    create_scenario_risk_radar,
+    create_external_risk_timeline,
+    create_fuel_budget_chart,
+    create_milestone_timeline,
+    create_model_benchmark_chart,
+    create_model_r2_chart,
+    create_uncertainty_chart,
+    create_shap_bar_chart,
+    create_shap_waterfall,
+    create_drift_chart,
 )
 
 # ─── Page Config ─────────────────────────────────────────────────────
@@ -74,6 +106,20 @@ with st.sidebar:
     labor_shock = st.slider("Labor Shortage %", 0, 50, 0, 5)
     equipment_shock = st.slider("Equipment Breakdown %", 0, 50, 0, 5)
 
+    st.subheader("🏗️ Business Constraints")
+    max_shift_hrs = st.slider("Max Shift Hours/Week", 36, 60, 48, 2)
+    fuel_budget_lakhs = st.slider("Fuel Budget (₹ Lakhs)", 10, 100, 50, 5)
+    overtime_mult = st.slider("Overtime Cost Multiplier", 1.0, 3.0, 1.5, 0.1)
+
+    st.subheader("🔬 Scenario Simulator")
+    run_simulator = st.checkbox("Run Scenario Comparison", value=False)
+    selected_scenarios = st.multiselect(
+        "Scenarios to Compare",
+        options=list(SCENARIO_LIBRARY.keys()),
+        default=["baseline", "monsoon_delay", "labor_crisis"],
+        format_func=lambda k: SCENARIO_LIBRARY[k].name,
+    )
+
     run_btn = st.button("🚀 Run Optimization", type="primary", use_container_width=True)
 
 # ─── Main Logic ──────────────────────────────────────────────────────
@@ -121,8 +167,9 @@ if run_btn or "schedule" in st.session_state:
         )
 
     # ─── Dashboard Tabs ─────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📊 Schedule", "🔧 Resources", "💰 Cost", "🤖 AI Risk", "📋 Data"
+    tab1, tab2, tab3, tab4, tab_ml, tab5, tab6, tab7, tab8 = st.tabs([
+        "📊 Schedule", "🔧 Resources", "💰 Cost", "🤖 AI Risk",
+        "🧪 ML Quality", "🌦️ Live Data", "📏 Constraints", "🔬 Simulator", "📋 Data",
     ])
 
     # ── Tab 1: Schedule ──────────────────────────────────────────────
@@ -205,8 +252,294 @@ if run_btn or "schedule" in st.session_state:
         else:
             st.success("No high-risk tasks detected! ✅")
 
-    # ── Tab 5: Raw Data ──────────────────────────────────────────────
+    # ── Tab ML: ML Quality Suite ──────────────────────────────────
+    with tab_ml:
+        st.subheader("🧪 ML Quality Suite")
+        st.markdown("Model benchmarking, uncertainty quantification, explainability & drift detection.")
+
+        ml_sub1, ml_sub2, ml_sub3, ml_sub4 = st.tabs([
+            "📊 Benchmarking", "📏 Uncertainty", "🔍 Explainability", "📉 Drift Detection",
+        ])
+
+        # ── Benchmarking ─────────────────────────────────────────────
+        with ml_sub1:
+            with st.spinner("Benchmarking models (XGBoost / LightGBM / CatBoost / sklearn)..."):
+                bench = benchmark_models()
+            bench_df = benchmark_to_dataframe(bench)
+
+            st.success(f"🏆 Best Model: **{bench['best_model_name']}** — MAE={bench['model_results'][bench['best_model_name']]['mae']} weeks")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.plotly_chart(create_model_benchmark_chart(bench_df), use_container_width=True)
+            with c2:
+                st.plotly_chart(create_model_r2_chart(bench_df), use_container_width=True)
+
+            st.subheader("Full Comparison Table")
+            st.dataframe(bench_df, use_container_width=True, hide_index=True)
+
+            # Cross-validation info
+            if "CV MAE (mean)" in bench_df.columns:
+                st.subheader("Cross-Validation (5-Fold)")
+                cv_df = bench_df[["Model", "CV MAE (mean)", "CV MAE (std)"]].dropna()
+                st.dataframe(cv_df, use_container_width=True, hide_index=True)
+
+        # ── Uncertainty ──────────────────────────────────────────────
+        with ml_sub2:
+            with st.spinner("Training quantile regressors for confidence intervals..."):
+                q_result = train_quantile_models()
+                unc_df = predict_with_uncertainty(
+                    tasks,
+                    q_result["models"],
+                    start_month=start_month,
+                    crew_experience=crew_exp,
+                    material_availability=mat_avail,
+                )
+
+            c1, c2, c3 = st.columns(3)
+            avg_width = unc_df["interval_width"].mean()
+            low_conf = len(unc_df[unc_df["confidence"].str.contains("Low")])
+            c1.metric("Avg Interval Width", f"{avg_width:.1f} weeks")
+            c2.metric("Low-Confidence Tasks", low_conf)
+            c3.metric("Method", "Quantile Regression")
+
+            st.plotly_chart(create_uncertainty_chart(unc_df), use_container_width=True)
+
+            st.subheader("Detailed Predictions with Intervals")
+            st.dataframe(
+                unc_df[["task_name", "delay_lower_10", "delay_median", "delay_upper_90", "interval_width", "confidence"]],
+                use_container_width=True, hide_index=True,
+            )
+
+        # ── Explainability ───────────────────────────────────────────
+        with ml_sub3:
+            with st.spinner("Computing SHAP explanations..."):
+                if "bench" not in dir():
+                    bench = benchmark_models()
+                shap_result = compute_shap_explanations(
+                    bench["best_model"], bench["X_train"], bench["X_test"],
+                )
+
+            st.info(f"Explainability method: **{shap_result['method']}**")
+            st.plotly_chart(
+                create_shap_bar_chart(shap_result["global_importance"]),
+                use_container_width=True,
+            )
+
+            # Per-task explanation
+            st.subheader("🔍 Explain Single Task")
+            task_names = [t.name for t in tasks]
+            selected_task_name = st.selectbox("Select task to explain", task_names)
+            selected_task = [t for t in tasks if t.name == selected_task_name][0]
+
+            explanation = explain_single_prediction(
+                bench["best_model"], selected_task, tasks,
+                start_month=start_month,
+                crew_experience=crew_exp,
+                material_availability=mat_avail,
+                X_train=bench["X_train"],
+            )
+            st.plotly_chart(
+                create_shap_waterfall(explanation),
+                use_container_width=True,
+            )
+
+            # Show raw contributions
+            contrib_rows = []
+            for feat, info in explanation["contributions"].items():
+                row = {"Feature": feat.replace("_", " ").title(), "Value": info["value"]}
+                if "shap_contribution" in info:
+                    row["SHAP Contribution"] = info["shap_contribution"]
+                    row["Effect"] = info["direction"]
+                else:
+                    row["Importance"] = info.get("importance", 0)
+                contrib_rows.append(row)
+            st.dataframe(pd.DataFrame(contrib_rows), use_container_width=True, hide_index=True)
+
+        # ── Drift Detection ──────────────────────────────────────────
+        with ml_sub4:
+            st.markdown("Detect when incoming data distribution changes vs training data.")
+
+            drift_scenario = st.selectbox(
+                "Drift Scenario",
+                ["none", "gradual", "sudden", "seasonal"],
+                format_func=lambda x: {
+                    "none": "✅ No Drift (control)",
+                    "gradual": "📈 Gradual Drift (climate change)",
+                    "sudden": "⚡ Sudden Drift (labor crisis)",
+                    "seasonal": "🌧️ Seasonal Drift (monsoon)",
+                }[x],
+            )
+
+            with st.spinner("Running drift detection..."):
+                ref_data, cur_data = simulate_drift_scenario(drift_type=drift_scenario)
+                drift_df = detect_data_drift(ref_data, cur_data)
+
+            drifted = len(drift_df[~drift_df["Status"].str.contains("No Drift")])
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Features Checked", len(drift_df))
+            c2.metric("Features Drifted", drifted)
+            c3.metric("Max PSI", f"{drift_df['PSI'].max():.3f}")
+
+            st.plotly_chart(create_drift_chart(drift_df), use_container_width=True)
+
+            st.subheader("Drift Report")
+            st.dataframe(drift_df, use_container_width=True, hide_index=True)
+
+            if drifted > 0:
+                st.warning(f"⚠️ {drifted} feature(s) show distribution drift — consider retraining the model.")
+            else:
+                st.success("✅ No significant data drift detected.")
+
+    # ── Tab 5: Live Data (Weather, Traffic, Events) ────────────────
     with tab5:
+        st.subheader("🌦️ External Risk Dashboard")
+        st.markdown("Real-time weather, traffic, and event data affecting the project timeline.")
+
+        with st.spinner("Fetching live data..."):
+            ext_risk = compute_weekly_external_risk(
+                start_month=start_month,
+                num_weeks=max(result["makespan"], 12),
+            )
+            weather_data = fetch_weather_forecast(start_month=start_month, num_weeks=max(result["makespan"], 12))
+            weather_df = weather_to_dataframe(weather_data)
+            traffic_data = fetch_traffic_conditions(num_weeks=max(result["makespan"], 12))
+            traffic_df = traffic_summary_dataframe(traffic_data)
+            events = fetch_calendar_events(start_month=start_month, num_weeks=max(result["makespan"], 12))
+            event_df = events_to_dataframe(events)
+
+        # KPI row
+        c1, c2, c3, c4 = st.columns(4)
+        avg_risk = ext_risk["combined_risk"].mean()
+        high_risk_weeks = len(ext_risk[ext_risk["combined_risk"] > 0.45])
+        c1.metric("Avg Weekly Risk", f"{avg_risk:.2f}")
+        c2.metric("High-Risk Weeks", high_risk_weeks)
+        c3.metric("Upcoming Events", len(event_df))
+        storm_weeks = len(weather_df[weather_df["condition"].isin(["Storm", "Rain"])])
+        c4.metric("Storm/Rain Weeks", storm_weeks)
+
+        st.plotly_chart(create_external_risk_timeline(ext_risk), use_container_width=True)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.subheader("🌡️ Weather Forecast")
+            st.dataframe(
+                weather_df[["date", "condition", "temperature_c", "precipitation_mm", "work_impact"]],
+                use_container_width=True, hide_index=True,
+            )
+        with col_b:
+            st.subheader("🚗 Traffic Summary")
+            st.dataframe(traffic_df, use_container_width=True, hide_index=True)
+
+        if len(event_df) > 0:
+            st.subheader("📅 Holidays, Strikes & Events")
+            st.dataframe(
+                event_df[["date", "event_name", "event_type", "severity", "affects_labor", "affects_transport"]],
+                use_container_width=True, hide_index=True,
+            )
+
+    # ── Tab 6: Business Constraints ──────────────────────────────────
+    with tab6:
+        st.subheader("📏 Business Constraint Validation")
+        st.markdown("Checks driver shifts, fuel budget, time windows, and priority milestones.")
+
+        with st.spinner("Running constraint checks..."):
+            shift_policy = ShiftPolicy(
+                max_hours_per_week=max_shift_hrs,
+                overtime_multiplier=overtime_mult,
+            )
+            fuel = FuelBudget(total_budget_inr=fuel_budget_lakhs * 100_000)
+            constraint_rpt = run_all_constraint_checks(
+                result["schedule"],
+                makespan=result["makespan"],
+                shift_policy=shift_policy,
+                fuel_budget=fuel,
+            )
+
+        summary = constraint_rpt["summary"]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Health", summary["health"])
+        c2.metric("Shift Warnings", summary["shift_warnings"])
+        c3.metric("Fuel Status", summary["fuel_status"])
+        c4.metric("Total Penalties", f"₹{summary['total_penalties_inr']:,.0f}")
+
+        # Fuel chart
+        st.plotly_chart(
+            create_fuel_budget_chart(constraint_rpt["fuel_report"]),
+            use_container_width=True,
+        )
+
+        # Milestone timeline
+        ms_df = constraint_rpt["milestone_report"]
+        if len(ms_df) > 0:
+            st.plotly_chart(create_milestone_timeline(ms_df), use_container_width=True)
+            st.subheader("🏁 Priority Milestones")
+            st.dataframe(
+                ms_df[["milestone", "priority", "deadline_week", "projected_finish", "status", "penalty_inr"]],
+                use_container_width=True, hide_index=True,
+            )
+
+        # Time windows
+        tw_df = constraint_rpt["time_window_report"]
+        if len(tw_df) > 0:
+            st.subheader("⏰ Time Window Compliance")
+            st.dataframe(tw_df, use_container_width=True, hide_index=True)
+
+        # Shift report
+        shift_df = constraint_rpt["shift_report"]
+        if len(shift_df) > 0:
+            st.subheader("👷 Shift Compliance")
+            st.dataframe(shift_df, use_container_width=True, hide_index=True)
+
+    # ── Tab 7: What-If Simulator ─────────────────────────────────────
+    with tab7:
+        st.subheader("🔬 What-If Scenario Simulator")
+        st.markdown("Compare multiple plans under different disruption scenarios.")
+
+        if run_simulator and len(selected_scenarios) >= 2:
+            with st.spinner("Running scenario simulations..."):
+                scenarios = [SCENARIO_LIBRARY[k] for k in selected_scenarios]
+                comp_df = run_comparison(scenarios, base_resource_caps=resource_caps)
+
+            st.dataframe(comp_df, use_container_width=True, hide_index=True)
+
+            feasible = comp_df[comp_df["Status"] != "INFEASIBLE"]
+            if len(feasible) >= 2:
+                st.plotly_chart(
+                    create_scenario_comparison_bar(feasible),
+                    use_container_width=True,
+                )
+                st.plotly_chart(
+                    create_scenario_risk_radar(feasible),
+                    use_container_width=True,
+                )
+
+            # Find best scenario
+            if len(feasible) > 0:
+                best = feasible.loc[feasible["Makespan (weeks)"].idxmin()]
+                st.success(f"🏆 **Best Scenario:** {best['Scenario']} — {best['Makespan (weeks)']} weeks makespan")
+
+        elif run_simulator:
+            st.warning("Select at least 2 scenarios to compare.")
+        else:
+            st.info("☑️ Enable **Run Scenario Comparison** in the sidebar and select scenarios to compare.")
+
+            # Show scenario library
+            st.subheader("📚 Available Scenarios")
+            lib_data = []
+            for key, sc in SCENARIO_LIBRARY.items():
+                lib_data.append({
+                    "Key": key,
+                    "Name": sc.name,
+                    "Description": sc.description,
+                    "Labor Shock": f"{sc.labor_shock_pct}%",
+                    "Equipment Shock": f"{sc.equipment_shock_pct}%",
+                    "Start Month": sc.start_month,
+                })
+            st.dataframe(pd.DataFrame(lib_data), use_container_width=True, hide_index=True)
+
+    # ── Tab 8: Raw Data ──────────────────────────────────────────────
+    with tab8:
         st.subheader("Task Details")
         st.dataframe(tasks_to_dataframe(tasks), use_container_width=True, hide_index=True)
 
@@ -230,3 +563,14 @@ else:
     with col3:
         st.markdown("### 🔧 What-If Analysis")
         st.markdown("Simulate labor shortages, equipment failures and see the impact in real-time")
+
+    col4, col5, col6 = st.columns(3)
+    with col4:
+        st.markdown("### 🌦️ Live Data Connectors")
+        st.markdown("Weather, traffic, holidays & strike data feed into project risk scoring")
+    with col5:
+        st.markdown("### 📏 Business Constraints")
+        st.markdown("Driver shift limits, fuel budgets, time windows & priority milestone tracking")
+    with col6:
+        st.markdown("### 🔬 Scenario Simulator")
+        st.markdown("Compare 7+ pre-built scenarios: monsoon, labor crisis, budget crunch, worst-case & more")

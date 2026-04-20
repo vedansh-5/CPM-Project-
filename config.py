@@ -44,3 +44,19 @@ DELAY_MODEL_FEATURES = [
     "crew_experience",       # 1-5
     "material_availability", # 0.0–1.0
 ]
+
+# ─── Business Constraint Defaults ────────────────────────────────────
+MAX_SHIFT_HOURS_PER_WEEK = 48
+MAX_CONSECUTIVE_WORK_DAYS = 6
+OVERTIME_COST_MULTIPLIER = 1.5
+DEFAULT_FUEL_BUDGET_INR = 5_000_000    # ₹50 lakh total
+DEFAULT_FUEL_WEEKLY_CAP_INR = 150_000  # ₹1.5 lakh/week
+DIESEL_PRICE_PER_LITRE = 95.0
+
+# ─── Priority Milestone Deadlines (task_id → deadline week) ─────────
+MILESTONE_DEADLINES = {
+    "Phase 1 — Site Ready": {"tasks": [3, 4, 5, 6, 7], "week": 16},
+    "Bridge Foundation":    {"tasks": [15],             "week": 30},
+    "Road Surface":         {"tasks": [13, 14],         "week": 40},
+    "Final Handover":       {"tasks": [23],             "week": 50},
+}
